@@ -131,3 +131,25 @@ class IngestionStateManager:
             if record:
                 return record.indexed_at.isoformat()
         return datetime.now(timezone.utc).isoformat()
+
+    def get_all_tracked_files(self) -> list[dict]:
+        """Returns a safe dictionary representation of all tracked files to prevent ORM leakage."""
+        with self.Session() as session:
+            records = session.query(FileState).all()
+            return [
+                {
+                    "repo_name": r.repo_name,
+                    "file_path": r.file_path,
+                    "absolute_path": r.absolute_path,
+                }
+                for r in records
+            ]
+
+    def remove_file_record(self, repo_name: str, file_path: str):
+        """Drops a specific file from the ledger (used during reconciliation)."""
+        with self.Session() as session:
+            session.query(FileState).filter_by(
+                repo_name=repo_name, file_path=file_path
+            ).delete()
+            session.commit()
+            logger.info(f"LEDGER PURGED: {file_path}")
