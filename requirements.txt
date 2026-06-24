@@ -1,0 +1,12 @@
+qdrant-client
+sentence-transformers
+fastapi
+uvicorn
+tiktoken
+presidio-analyzer
+presidio-anonymizer
+sqlalchemy
+tqdm
+python-dotenv
+pydantic
+mistralai
