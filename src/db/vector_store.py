@@ -1,4 +1,3 @@
-# src/db/vector_store.py
 import os
 import logging
 from dotenv import load_dotenv

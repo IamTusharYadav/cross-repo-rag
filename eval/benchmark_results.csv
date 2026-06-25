@@ -1,0 +1,7 @@
+Metric,Dense Baseline,Dense + AST Rerank,Dense + Repo Expansion + AST
+MRR,0.5,0.5,0.5
+Recall@1,0.5,0.5,0.5
+Recall@3,0.5,0.5,0.5
+Recall@5,0.5,0.5,0.5
+Recall@10,0.5,0.5,0.5
+P95 Latency (ms),291.1061150018213,116.68656000038027,206.6887350028992

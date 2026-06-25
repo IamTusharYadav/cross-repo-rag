@@ -10,3 +10,5 @@ tqdm
 python-dotenv
 pydantic
 mistralai
+tabulate
+pandas

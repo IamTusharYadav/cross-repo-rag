@@ -1,7 +1,7 @@
 import os
 from src.db.state_manager import IngestionStateManager
 
-# 1. Setup paths
+# Setup paths
 repo_root = os.path.abspath("./data")
 
 file_a = os.path.join(repo_root, "fastapi", "fastapi", "utils.py")
@@ -9,11 +9,11 @@ file_b = os.path.join(
     repo_root, "qdrant-client", "qdrant_client", "common", "version_check.py"
 )
 
-# 2. Initialize Ledger
+# Initialize Ledger
 ledger = IngestionStateManager("sqlite:///data/test_ledger.db")
 
 
-# 3. Test Ingestion
+# Test Ingestion
 def test_file(abs_path, repo):
     print(f"\nTesting {repo} -> {os.path.basename(abs_path)}...")
     if ledger.needs_processing(abs_path, repo_root, repo):
