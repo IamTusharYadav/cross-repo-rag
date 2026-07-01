@@ -1,0 +1,222 @@
+[
+  {
+    "id": "Q001",
+    "question": "How is a FastAPI application initialized?",
+    "expected_files": [
+      "fastapi/fastapi/applications.py"
+    ]
+  },
+  {
+    "id": "Q002",
+    "question": "Where is APIRouter implemented?",
+    "expected_files": [
+      "fastapi/fastapi/routing.py"
+    ]
+  },
+  {
+    "id": "Q003",
+    "question": "How are startup and shutdown events managed?",
+    "expected_files": [
+      "fastapi/fastapi/applications.py"
+    ]
+  },
+  {
+    "id": "Q004",
+    "question": "How does dependency injection work?",
+    "expected_files": [
+      "fastapi/fastapi/dependencies/utils.py"
+    ]
+  },
+  {
+    "id": "Q005",
+    "question": "Where are BackgroundTasks implemented?",
+    "expected_files": [
+      "fastapi/fastapi/background.py"
+    ]
+  },
+  {
+    "id": "Q006",
+    "question": "How are HTTP exceptions handled?",
+    "expected_files": [
+      "fastapi/fastapi/exception_handlers.py"
+    ]
+  },
+  {
+    "id": "Q007",
+    "question": "Where are request parameters validated?",
+    "expected_files": [
+      "fastapi/fastapi/dependencies/utils.py"
+    ]
+  },
+  {
+    "id": "Q008",
+    "question": "How are response models serialized?",
+    "expected_files": [
+      "fastapi/fastapi/routing.py"
+    ]
+  },
+  {
+    "id": "Q009",
+    "question": "Where is OpenAPI schema generation implemented?",
+    "expected_files": [
+      "fastapi/fastapi/openapi/utils.py"
+    ]
+  },
+  {
+    "id": "Q010",
+    "question": "How are middleware added to a FastAPI app?",
+    "expected_files": [
+      "fastapi/fastapi/applications.py"
+    ]
+  },
+  {
+    "id": "Q011",
+    "question": "How do I create a Qdrant client?",
+    "expected_files": [
+      "qdrant-client/qdrant_client/qdrant_client.py"
+    ]
+  },
+  {
+    "id": "Q012",
+    "question": "How do I create a collection?",
+    "expected_files": [
+      "qdrant-client/qdrant_client/qdrant_client.py"
+    ]
+  },
+  {
+    "id": "Q013",
+    "question": "How are vectors upserted?",
+    "expected_files": [
+      "qdrant-client/qdrant_client/qdrant_client.py"
+    ]
+  },
+  {
+    "id": "Q014",
+    "question": "How is vector search performed?",
+    "expected_files": [
+      "qdrant-client/qdrant_client/qdrant_client.py"
+    ]
+  },
+  {
+    "id": "Q015",
+    "question": "How are payload filters used?",
+    "expected_files": [
+      "qdrant-client/qdrant_client/http/models/models.py"
+    ]
+  },
+  {
+    "id": "Q016",
+    "question": "Where is AsyncQdrantClient implemented?",
+    "expected_files": [
+      "qdrant-client/qdrant_client/async_qdrant_client.py"
+    ]
+  },
+  {
+    "id": "Q017",
+    "question": "How are collections deleted?",
+    "expected_files": [
+      "qdrant-client/qdrant_client/qdrant_client.py"
+    ]
+  },
+  {
+    "id": "Q018",
+    "question": "How are batch operations supported?",
+    "expected_files": [
+      "qdrant-client/qdrant_client/qdrant_client.py"
+    ]
+  },
+  {
+    "id": "Q019",
+    "question": "Where are distance metrics defined?",
+    "expected_files": [
+      "qdrant-client/qdrant_client/http/models/models.py"
+    ]
+  },
+  {
+    "id": "Q020",
+    "question": "How are points retrieved by ID?",
+    "expected_files": [
+      "qdrant-client/qdrant_client/qdrant_client.py"
+    ]
+  },
+  {
+    "id": "Q021",
+    "question": "How should AsyncQdrantClient be initialized in a FastAPI lifespan?",
+    "expected_files": [
+      "fastapi/fastapi/applications.py",
+      "qdrant-client/qdrant_client/async_qdrant_client.py"
+    ]
+  },
+  {
+    "id": "Q022",
+    "question": "How can FastAPI perform vector search using Qdrant?",
+    "expected_files": [
+      "fastapi/fastapi/routing.py",
+      "qdrant-client/qdrant_client/qdrant_client.py"
+    ]
+  },
+  {
+    "id": "Q023",
+    "question": "How should a shared Qdrant client be injected into FastAPI endpoints?",
+    "expected_files": [
+      "fastapi/fastapi/dependencies/utils.py",
+      "qdrant-client/qdrant_client/qdrant_client.py"
+    ]
+  },
+  {
+    "id": "Q024",
+    "question": "Where should a vector database connection be opened in FastAPI?",
+    "expected_files": [
+      "fastapi/fastapi/applications.py",
+      "qdrant-client/qdrant_client/async_qdrant_client.py"
+    ]
+  },
+  {
+    "id": "Q025",
+    "question": "How can asynchronous upserts avoid blocking FastAPI?",
+    "expected_files": [
+      "fastapi/fastapi/background.py",
+      "qdrant-client/qdrant_client/async_qdrant_client.py"
+    ]
+  },
+  {
+    "id": "Q026",
+    "question": "How should FastAPI lifespan manage Qdrant resources?",
+    "expected_files": [
+      "fastapi/fastapi/applications.py",
+      "qdrant-client/qdrant_client/async_qdrant_client.py"
+    ]
+  },
+  {
+    "id": "Q027",
+    "question": "How can a FastAPI endpoint insert embeddings into Qdrant?",
+    "expected_files": [
+      "fastapi/fastapi/routing.py",
+      "qdrant-client/qdrant_client/qdrant_client.py"
+    ]
+  },
+  {
+    "id": "Q028",
+    "question": "How can request handlers execute Qdrant searches?",
+    "expected_files": [
+      "fastapi/fastapi/routing.py",
+      "qdrant-client/qdrant_client/qdrant_client.py"
+    ]
+  },
+  {
+    "id": "Q029",
+    "question": "Which async APIs from FastAPI and Qdrant should be combined?",
+    "expected_files": [
+      "fastapi/fastapi/applications.py",
+      "qdrant-client/qdrant_client/async_qdrant_client.py"
+    ]
+  },
+  {
+    "id": "Q030",
+    "question": "How can FastAPI expose semantic search backed by Qdrant?",
+    "expected_files": [
+      "fastapi/fastapi/routing.py",
+      "qdrant-client/qdrant_client/qdrant_client.py"
+    ]
+  }
+]

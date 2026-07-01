@@ -228,10 +228,10 @@ class RepositoryIngestionPipeline:
 
             # Preserve the chunker's original chunk_id (SHA-256) for debugging and
             # retrieval evaluation.  semantic_chunk_id is the ingestion-layer identity
-            # used to derive point_id; writing both makes the payload self-documenting.
+            # used to derive point_id
             meta["semantic_chunk_id"] = semantic_chunk_id
             meta["point_id"] = point_id
-            meta["page_content"] = text
+            # meta["page_content"] = text
 
             upserted_ids.append(point_id)
 

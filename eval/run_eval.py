@@ -5,23 +5,40 @@ from dotenv import load_dotenv
 import asyncio
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
+from fastembed import SparseTextEmbedding
 from src.search.heuristic_reranker import ASTAwareReranker
 
 load_dotenv()
 
 
 class RetrievalEvaluator:
+    # Primary Retrieval Phase Limits
+    PRIMARY_PREFETCH_LIMIT = 60  # Depth of initial dense/sparse streams before fusion
+    PRIMARY_POOL_LIMIT = 20  # Max candidates kept after initial RRF fusion
+
+    # Domain Expansion Phase Limits
+    EXPANSION_PREFETCH_LIMIT = (
+        45  # Depth of per-repo dense/sparse streams before fusion
+    )
+    EXPANSION_POOL_LIMIT = 15  # Max candidates pulled per active repository domain
+
     def __init__(self):
         self.qdrant_client = QdrantClient(
             url=os.getenv("QDRANT_URL"), api_key=os.getenv("QDRANT_API_KEY")
         )
+
+        # Dense Encoder
         self.embed_model = SentenceTransformer("BAAI/bge-base-en-v1.5")
+
+        # Sparse Encoder
+        self.sparse_embed_model = SparseTextEmbedding(model_name="Qdrant/bm25")
+
         self.ast_reranker = ASTAwareReranker()
 
-        with open("eval/golden_questions.json", "r") as f:
+        with open("eval/dataset_v1.json", "r") as f:
             self.dataset = json.load(f)
 
     def _calculate_metrics(
@@ -53,6 +70,22 @@ class RetrievalEvaluator:
         metrics["mrr"] = mrr
         return metrics
 
+    def _encode_hybrid_query(
+        self, text: str
+    ) -> Tuple[List[float], models.SparseVector]:
+        """
+        Encodes query string into both normalized dense float arrays and
+        structured sparse key-value paired tokens.
+        """
+        dense_res = self.embed_model.encode(text, normalize_embeddings=True).tolist()
+
+        sparse_raw = list(self.sparse_embed_model.embed([text]))[0]
+        sparse_res = models.SparseVector(
+            indices=sparse_raw.indices.tolist(),
+            values=sparse_raw.values.tolist(),
+        )
+        return dense_res, sparse_res
+
     async def evaluate_pipeline(self, mode: str) -> pd.DataFrame:
         results = []
         print(f"\nRunning Pipeline Variant: [Mode = {mode.upper()}] ---")
@@ -60,17 +93,29 @@ class RetrievalEvaluator:
         for item in self.dataset:
             start_time = time.perf_counter()
 
-            # Stage 1: Dense Retrieval Pass (Global Semantic Anchor)
-            query_vector = await asyncio.to_thread(
-                lambda: self.embed_model.encode(item["question"]).tolist()
+            # Hybrid Retrieval Pass (Global Semantic + Lexical Anchor)
+            dense_vector, sparse_vector = await asyncio.to_thread(
+                self._encode_hybrid_query, item["question"]
             )
 
-            # Initial candidate pool
+            # Initial candidate pool using unified Reciprocal Rank Fusion (RRF)
             response = await asyncio.to_thread(
                 lambda: self.qdrant_client.query_points(
                     collection_name="cross_repo_rag",
-                    query=query_vector,
-                    limit=20,
+                    prefetch=[
+                        models.Prefetch(
+                            query=dense_vector,
+                            using="dense",
+                            limit=self.PRIMARY_PREFETCH_LIMIT,
+                        ),
+                        models.Prefetch(
+                            query=sparse_vector,
+                            using="sparse",
+                            limit=self.PRIMARY_PREFETCH_LIMIT,
+                        ),
+                    ],
+                    query=models.FusionQuery(fusion=models.Fusion.RRF),
+                    limit=self.PRIMARY_POOL_LIMIT,
                     with_payload=True,
                 )
             )
@@ -78,7 +123,7 @@ class RetrievalEvaluator:
 
             final_pool = list(initial_hits)
 
-            # Stage 2: Repository-Aware Candidate Expansion (Production Variant)
+            # Repository-Aware Candidate Expansion (Production Hybrid Variant)
             if mode == "diversified_ast":
                 # Detect active repositories represented in the semantic anchor pool
                 detected_repos = set()
@@ -98,7 +143,19 @@ class RetrievalEvaluator:
                     repo_response = await asyncio.to_thread(
                         lambda: self.qdrant_client.query_points(
                             collection_name="cross_repo_rag",
-                            query=query_vector,
+                            prefetch=[
+                                models.Prefetch(
+                                    query=dense_vector,
+                                    using="dense",
+                                    limit=self.EXPANSION_PREFETCH_LIMIT,
+                                ),
+                                models.Prefetch(
+                                    query=sparse_vector,
+                                    using="sparse",
+                                    limit=self.EXPANSION_PREFETCH_LIMIT,
+                                ),
+                            ],
+                            query=models.FusionQuery(fusion=models.Fusion.RRF),
                             query_filter=models.Filter(
                                 must=[
                                     models.FieldCondition(
@@ -107,7 +164,7 @@ class RetrievalEvaluator:
                                     )
                                 ]
                             ),
-                            limit=15,  # Dig deep into each identified domain
+                            limit=self.EXPANSION_POOL_LIMIT,  # Dig deep into each identified domain
                             with_payload=True,
                         )
                     )
@@ -127,19 +184,11 @@ class RetrievalEvaluator:
                         deduplicated_pool.append(h)
                 final_pool = deduplicated_pool
 
-            # Stage 3: Ranking/Sorting Selection
-            # DEBUGGING BLOCK
-            if mode == "diversified_ast" and item["id"] == "q1":
-                print(f"\nDEBUGGING DIVERSIFIED POOL FOR QUESTION 1")
-                print(f"Total points collected in final_pool: {len(final_pool)}")
-                print("All file paths present in the pool:")
-                for idx, h in enumerate(final_pool):
-                    p = h.payload if hasattr(h, "payload") else h.get("payload", {})
-                    print(f"  [{idx}] {p.get('file_path')}")
+            # Ranking/Sorting Selection
             if mode in ["ast_only", "diversified_ast"]:
                 processed_hits = self.ast_reranker.rerank(item["question"], final_pool)
             else:
-                # Dense Baseline Sorting
+                # Hybrid Baseline Ranking Sort
                 processed_hits = [
                     {
                         "id": h.id,
@@ -173,7 +222,7 @@ class RetrievalEvaluator:
         return pd.DataFrame(results)
 
     async def run(self):
-        print("⚡ Initiating Comparative Ablation Benchmark Run...")
+        print("Initiating Comparative Ablation Benchmark Run...")
 
         df_base = await self.evaluate_pipeline(mode="baseline")
         df_ast = await self.evaluate_pipeline(mode="ast_only")
@@ -188,7 +237,7 @@ class RetrievalEvaluator:
                 "Recall@10",
                 "P95 Latency (ms)",
             ],
-            "Dense Baseline": [
+            "Hybrid (Dense + BM25 + RRF) Baseline": [
                 df_base["mrr"].mean(),
                 df_base["recall_1"].mean(),
                 df_base["recall_3"].mean(),
@@ -196,7 +245,7 @@ class RetrievalEvaluator:
                 df_base["recall_10"].mean(),
                 np.percentile(df_base["latency_ms"], 95),
             ],
-            "Dense + AST Rerank": [
+            "Hybrid + AST Rerank": [
                 df_ast["mrr"].mean(),
                 df_ast["recall_1"].mean(),
                 df_ast["recall_3"].mean(),
@@ -204,7 +253,7 @@ class RetrievalEvaluator:
                 df_ast["recall_10"].mean(),
                 np.percentile(df_ast["latency_ms"], 95),
             ],
-            "Dense + Repo Expansion + AST": [
+            "Hybrid + Repo Expansion + AST": [
                 df_div["mrr"].mean(),
                 df_div["recall_1"].mean(),
                 df_div["recall_3"].mean(),
@@ -218,15 +267,17 @@ class RetrievalEvaluator:
         df_summary.to_csv("eval/benchmark_results.csv", index=False)
 
         report_md = f"""# Retrieval Layer Ablation Benchmark Report
-Generated on: 2026-06-25
+Generated on: 2026-07-01
 
 ## Aggregated Pipeline Performance Comparison
 {df_summary.to_markdown(index=False)}
 """
-        with open("eval/report.md", "w") as f:
+        with open("eval/hybrid_report.md", "w") as f:
             f.write(report_md)
 
-        print("Benchmarks successfully executed. Results compiled in 'eval/report.md'.")
+        print(
+            "Benchmarks successfully executed. Results compiled in 'eval/hybrid_report.md'."
+        )
 
 
 if __name__ == "__main__":

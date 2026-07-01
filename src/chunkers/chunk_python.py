@@ -525,6 +525,31 @@ class PythonASTChunker:
         rel_path = os.path.relpath(file_path)
         path_obj = Path(rel_path)
 
+        normalized_path = os.path.normpath(file_path)
+        path_parts = normalized_path.split(os.sep)
+        filename = path_parts[-1] if path_parts else ""
+        dir_parts = set(path_parts[:-1])
+
+        # ignore lists for FastAPI + Qdrant
+        ignored_dirs = {
+            "tests",
+            "__pycache__",
+            "htmlcov",
+            ".venv",
+            ".env",
+            "scripts",
+            "tools",
+            ".github",
+            "benchmarks",
+            ".agents",
+        }
+        ignored_files = {".env", "conftest.py"}
+
+        # Guard both folder segments and specific standalone filenames
+        if dir_parts.intersection(ignored_dirs) or filename in ignored_files:
+            logger.info(f"Skipping ignored file or directory path: {normalized_path}")
+            return chunks
+
         if state_manager is not None:
             if not state_manager.needs_processing(file_path, repo_root, repo_name):
                 logger.info(

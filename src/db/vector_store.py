@@ -1,9 +1,11 @@
 import os
 import logging
 from dotenv import load_dotenv
+from typing import Tuple, List, Dict, Any
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from sentence_transformers import SentenceTransformer
+from fastembed import SparseTextEmbedding
 
 load_dotenv()
 
@@ -16,7 +18,7 @@ class VectorStoreManager:
 
     Public surface used by RepositoryIngestionPipeline:
         init_collection()                        -- idempotent collection + index setup
-        embed_chunks(texts)                      -- encode text -> normalised float vectors
+        embed_chunks(texts)                      -- encode text -> dense + sparse vectors
         upsert_chunks(texts, embeddings, metas)  -- build PointStructs and write to collection
         upsert_points(points)                    -- write pre-built PointStructs (testing)
         delete_file_chunks(repo, path)           -- wipe every vector belonging to a file
@@ -46,10 +48,22 @@ class VectorStoreManager:
             )
             self.client = QdrantClient(path=self.LOCAL_QDRANT_PATH)
 
-        self.embedding_model_name = "BAAI/bge-base-en-v1.5"
-        logger.info(f"Loading embedding model: {self.embedding_model_name}...")
-        self.encoder = SentenceTransformer(self.embedding_model_name)
-        self.vector_size = self.encoder.get_sentence_embedding_dimension()
+        # Dense Encoder Setup
+        self.dense_embedding_model_name = "BAAI/bge-base-en-v1.5"
+        logger.info(
+            f"Loading dense embedding model: {self.dense_embedding_model_name}..."
+        )
+        self.encoder = SentenceTransformer(self.dense_embedding_model_name)
+        self.vector_size = self.encoder.get_embedding_dimension()
+
+        # Sparse Encoder Setup
+        self.sparse_embedding_model_name = "Qdrant/bm25"
+        logger.info(
+            f"Loading sparse embedding model: {self.sparse_embedding_model_name}..."
+        )
+        self.sparse_encoder = SparseTextEmbedding(
+            model_name=self.sparse_embedding_model_name
+        )
 
     # Collection management
 
@@ -60,16 +74,22 @@ class VectorStoreManager:
         """
         try:
             if not self.client.collection_exists(self.collection_name):
-                logger.info(
-                    f"Creating collection '{self.collection_name}' "
-                    f"with dimension {self.vector_size}..."
-                )
+                logger.info(f"Creating collection '{self.collection_name}'")
                 self.client.create_collection(
                     collection_name=self.collection_name,
-                    vectors_config=models.VectorParams(
-                        size=self.vector_size,
-                        distance=models.Distance.COSINE,
-                    ),
+                    vectors_config={
+                        "dense": models.VectorParams(
+                            size=self.vector_size,
+                            distance=models.Distance.COSINE,
+                        )
+                    },
+                    # Inject server-side lexical index engine
+                    sparse_vectors_config={
+                        "sparse": models.SparseVectorParams(
+                            modifier=models.Modifier.IDF,  # Dynamically handles BM25 IDF math
+                            index=models.SparseIndexParams(on_disk=True),
+                        )
+                    },
                 )
             else:
                 logger.info(f"Collection '{self.collection_name}' already exists.")
@@ -99,12 +119,14 @@ class VectorStoreManager:
 
     # Embedding
 
-    def embed_chunks(self, texts: list[str]) -> list[list[float]]:
+    def embed_chunks(self, texts: list[str]) -> Tuple[List[List[float]], List[Any]]:
         """
-        Encodes a list of text strings into L2-normalised dense vectors.
+        Encodes a list of text strings into L2-normalised dense vectors and sparse embeddings.
         """
         if not texts:
-            return []
+            return [], []
+
+        # Compute Dense Vector via SentenceTransformer
         embeddings = self.encoder.encode(
             texts,
             batch_size=32,
@@ -112,28 +134,55 @@ class VectorStoreManager:
             normalize_embeddings=True,
             show_progress_bar=False,
         )
-        return embeddings.tolist()
+        dense_embeddings = embeddings.tolist()
+
+        # Compute Sparse Matrix via FastEmbed
+        sparse_embeddings = list(self.sparse_encoder.embed(texts))
+
+        return dense_embeddings, sparse_embeddings
 
     # Write operations
 
     def upsert_chunks(
         self,
         texts: list[str],
-        embeddings: list[list[float]],
-        metas: list[dict],
+        embeddings: Tuple[List[List[float]], List[Any]],
+        metas: List[Dict[str, Any]],
     ) -> None:
         """
-        Constructs PointStructs from pre-computed embeddings and metadata dicts,
+        Constructs PointStructs from pre-computed hybrid embeddings and metadata dicts,
         then writes them to the collection in a single upsert call.
         """
         if not texts:
             return
-        points = [
-            models.PointStruct(
-                id=metas[i]["point_id"], vector=embeddings[i], payload=metas[i]
+
+        dense_embeddings, sparse_embeddings = embeddings
+
+        if not (
+            len(texts) == len(dense_embeddings) == len(sparse_embeddings) == len(metas)
+        ):
+            raise ValueError(
+                "texts, dense embeddings, sparse embeddings, and metadata must have equal lengths."
             )
-            for i in range(len(texts))
-        ]
+
+        points = []
+        for i in range(len(texts)):
+            payload = {"text_content": texts[i], **metas[i]}
+
+            points.append(
+                models.PointStruct(
+                    id=metas[i]["point_id"],
+                    vector={
+                        "dense": dense_embeddings[i],
+                        "sparse": models.SparseVector(
+                            indices=sparse_embeddings[i].indices.tolist(),
+                            values=sparse_embeddings[i].values.tolist(),
+                        ),
+                    },
+                    payload=payload,
+                )
+            )
+
         self.client.upsert(collection_name=self.collection_name, points=points)
 
     def upsert_points(self, points: list[models.PointStruct]) -> None:

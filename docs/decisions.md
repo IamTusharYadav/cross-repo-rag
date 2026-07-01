@@ -1,106 +1,139 @@
-# Architecture Decisions Log (`decisions.md`)
-
-This document records the critical architectural decisions, trade-offs, and technical solutions governing the data engineering, ingestion tracking, and vector indexing layers of the Cross-Repo RAG system.
+# Architecture Decisions Log
+This document records the architectural decisions, trade-offs, and evidence behind the ingestion, retrieval, and evaluation layers of the Cross-Repo RAG system.
 
 ---
 
 ## 1. Local Cache Invalidation Topology: Relational State Ledger via SQLite
-* **Context**: Parsing and embedding large-scale engineering software repositories (e.g., `fastapi`, `qdrant-client`) introduces intense computational strain, high third-party embedding API costs, and vector collection drift if performed from scratch on every pipeline iteration.
+
+* **Context**: Parsing and embedding large repositories (`fastapi`, `qdrant-client`) on every run introduces unnecessary compute cost and vector collection drift.
 * **Options Considered**:
-    1.  **Stateless Full Re-Indexing**: Clear the database index and process every asset on every execution line. (Simple to build, but fails to scale linearly).
-    2.  **In-Vector Payload Inspections**: Query the remote vector store at runtime to check if a specific path exists prior to document reading. (Creates a massive network call bottleneck and cannot reliably catch in-place file content modifications).
-    3.  **Out-of-Band State Tracking Ledger (`SQLite`)**: Track repository file state locally via a persistent relational schema.
-* **Decision**: Chosen **Option 3 (Out-of-Band SQLite State Ledger)**.
-* **Justification**: Implemented via `src.db.state_manager.IngestionStateManager`. By tracking target records using an atomic `needs_processing()` method, the ingestion worker achieves highly efficient $O(1)$ local signature tracking. This bounds vector generation strictly to new or modified files, minimizing token spending and network roundtrips.
+  1. **Stateless Full Re-Indexing** — simple, but doesn't scale.
+  2. **In-Vector Payload Inspections** — checking Qdrant at runtime for existing paths; expensive network round-trips, can't reliably detect in-place content edits.
+  3. **Out-of-Band State Tracking Ledger (SQLite)** — track file state locally in a relational schema.
+* **Decision**: Option 3.
+* **Justification**: Implemented via `src.db.state_manager.IngestionStateManager`. The `needs_processing()` method gives O(1) local signature lookups, bounding embedding work strictly to new or modified files.
 
 ---
 
-## 2. Ingestion Domain Separation: Orchestration vs. Vector Responsibilities
-* **Context**: Bundling system logic—such as parsing, custom credential sanitization, AST splitting, tokenization budgets, and network transport drivers—into a single engine creates fragile, unmaintainable modules that are complex to unit-test.
+## 2. Vector Key Strategy: Deterministic Namespace-Driven UUID5
+
+* **Context**: Vector stores need unique point IDs. Random IDs (UUID4) turn re-runs into permanent duplicate insertions instead of updates.
 * **Options Considered**:
-    1.  **Monolithic Ingestion Script**: A singular pipeline handling file crawls, direct string cleansing, and raw database engine requests.
-    2.  **Decoupled Orchestration Engine Layer**: Isolate raw vector data structures, array embedding loops, and bulk transfers into a backend-specific layer.
-* **Decision**: Chosen **Option 2 (Decoupled Orchestration Engine Layer)**.
-* **Justification**: The ingestion workspace strictly partitions responsibilities between `src/ingest.py` (which manages repository crawling, path tracking, regex-based secret redaction, and file-type chunking calls) and `src/db/vector_store.py` (which abstracts the target vector store SDK connection parameters and data models). This ensures that changing the target vector database vendor requires altering only the collection wrapper, keeping the ingestion workflow fully intact.
+  1. **Auto-incrementing integer sequences** — breaks under multi-process writes across repos.
+  2. **Random UUID4** — bloats the index on every re-run.
+  3. **Deterministic UUID5** derived from a stable chunk identity string.
+* **Decision**: Option 3.
+* **Justification**: `uuid.uuid5(uuid.NAMESPACE_DNS, semantic_chunk_id)`. Re-running ingestion updates the same point slot instead of duplicating it — this is what makes the SQLite ledger in Decision 1 actually safe to combine with re-indexing.
 
 ---
 
-## 3. Vector Key Strategy: Deterministic Namespace-Driven UUID5
-* **Context**: Target database vector stores require a unique identity key (uint64 or string UUID) for each item slot. Randomly generated primary keys (`UUID4`) prevent deterministic tracking, causing duplications if an identical file block is re-indexed.
+## 3. Chunk Tracking Integrity: Structural Signature vs. Stable Semantic Address
+
+* **Context**: Line numbers shift as code changes; a purely line-based or hash-based ID cascades into broken identities across a file after any edit.
+* **Decision**: Track both identifiers as parallel metadata:
+  * **`chunk_id`** (SHA-256 of literal text) — detects whether content has physically changed.
+  * **`semantic_chunk_id`** (`{repo}::{symbol_path}::chunk{idx}`) — a stable logical coordinate independent of line drift, used as the UUID5 source for Decision 2.
+
+---
+
+## 4. Operational Resilience: Post-File Drift Pruning & Atomic State Processing
+
+* **Context**: Edited or shrunk files leave orphaned vectors behind if old chunks aren't cleaned up; deleted files leave orphaned vectors indefinitely.
+* **Design**:
+  * **Atomicity**: `src/ingest.py` follows chunk → redact → embed → upsert → prune, in that order. The file is only marked processed in SQLite after every stage succeeds, so a failure mid-pipeline is retried cleanly on the next run rather than leaving a half-written state.
+  * **Drift pruning**: `VectorStoreManager.prune_file_chunks()` deletes any vector tied to a file but absent from the current run's active-ID set.
+  * **Orphan reconciliation**: a separate pass compares the SQLite ledger against the filesystem and removes vectors/records for files that no longer exist on disk.
+
+---
+
+## 5. Benchmark Redesign: From Regression Questions to a Representative Developer Benchmark
+
+* **Context**: The original evaluation set was a small number of manually written regression-style questions — useful for smoke-testing, but too small to support statistically meaningful comparisons between retrieval configurations.
+* **Decision**: Replace it with a 30-question benchmark, split across three categories — FastAPI-only, Qdrant-only, and cross-repository integration — phrased as natural developer questions rather than filename lookups, so the benchmark exercises semantic retrieval rather than string matching.
+* **Consequence**: this became the fixed evaluation set for every retrieval-layer ablation described below (Decisions 6, 8, 9). Any future reranker or retrieval tuning should be checked against a held-out split of this set, not the full set, to avoid tuning decisions against the same questions used to measure them.
+
+---
+
+## 6. Evidence-Driven Bottleneck Diagnosis: Candidate Generation Before Reranking
+
+* **Context**: With AST-aware reranking in place, Recall@10 on the 30-question benchmark still sat below 30% (see *Benchmark A* in Benchmark Results below) — i.e., relevant files were frequently missing from the candidate pool entirely, not merely mis-ranked within it.
 * **Options Considered**:
-    1.  **Auto-Incrementing Global Integer Sequences**: Maintaining a numeric counter inside the state machine database. (Breaks during parallel multi-process writes across separate code bases).
-    2.  **Random String Values (`UUID4`)**: Generating a random token signature for every vector entry. (Turns system re-runs into permanent insertions, bloating database size).
-    3.  **Deterministic Namespace Derivation (`UUID5`)**: Instantiating unique point IDs derived from a highly structured, stable string address unique to that chunk.
-* **Decision**: Chosen **Option 3 (Deterministic UUID5 Point IDs)**.
-* **Justification**: Implemented using Python's native `uuid.uuid5(uuid.NAMESPACE_DNS, semantic_chunk_id)` mapping inside the batch pipeline. This approach guarantees idempotent indexing behavior: repeating a run updates the exact same point slot without duplicate generation.
+  1. Keep tuning reranker heuristics.
+  2. Add filename-specific boosting for known targets (see Decision 7 — rejected).
+  3. Run a systematic evaluation to isolate whether the bottleneck was candidate generation or reranking.
+* **Decision**: Option 3.
+* **Finding**: correct files were frequently absent from the top-10 candidates before reranking ever ran (confirmed via deep-pool debugging in `eval_true_rank.py`, which found target files absent up to a search depth of 150). No amount of reranker tuning can recover a document that was never retrieved. This redirected effort toward candidate generation — hybrid dense + sparse retrieval (Decision 8) and repository-aware expansion (Decision 9).
 
 ---
 
-## 4. Chunk Tracking Integrity: Structural Signature vs. Stable Semantic Address
-* **Context**: Source code is fluid; line numbers shift downward as changes are introduced. If vector storage identifiers are tied purely to line positions or simple sequence hashes, localized code edits can cause a cascade of broken vector identities throughout the remaining file blocks.
+## 7. Rejected Alternative: Filename-Specific Boosting
+
+* **Context**: Following the diagnosis in Decision 6, one quick fix would have been to hardcode score boosts for filenames known to be benchmark targets (e.g. `qdrant_client.py`).
+* **Decision**: Rejected.
+* **Justification**: this would inflate benchmark metrics without improving the underlying retrieval model, and would couple the system to the naming conventions of these two specific repositories — breaking generalization to any other codebase pair a user might index.
+
+---
+
+## 8. Hybrid Candidate Generation: Dense + Sparse (BM25) + RRF
+
+* **Context**: Dense retrieval alone favored explanatory documentation over implementation code, and missed files identifiable mainly by exact lexical signals — API names, filenames, class names — that don't embed distinctively.
 * **Options Considered**:
-    1.  **Strict Hash Tracking (`chunk_id`)**: A unique SHA-256 string derived purely from a chunk's literal text. (Fragile to superficial syntax formatting updates or typo fixes).
-    2.  **Stable Structural Addressing (`semantic_chunk_id`)**: Building a composite logical location coordinates pattern (`{repo}::{symbol_path}::chunk{idx}`).
-* **Decision**: Co-implemented both identifiers as parallel, complementary metadata properties.
-* **Justification**:
-    * **`chunk_id`** (SHA-256): Represents a rigid snapshot signature of literal text, enabling the state ledger to quickly verify if content inside a file has physically shifted.
-    * **`semantic_chunk_id`**: Establishes a logical location anchor (e.g., fallback pattern `{file_path}_{chunk_start_line}_{chunk_end_line}_{text}`). This provides downstream search workers and graph traversal agents with an unmoving, semantic coordinate link regardless of changing parent line indexes.
+  1. Dense-only (status quo).
+  2. Increase dense `top_k` depth.
+  3. Add a parallel sparse (BM25) lexical pathway, merged with dense via Reciprocal Rank Fusion.
+* **Decision**: Option 3.
+* **Implementation**: dense (BGE embeddings) and sparse (BM25) queries run in parallel; results are merged via Qdrant's native RRF.
+* **Result**: see *Benchmark B* in Benchmark Results below (Hybrid baseline column) — improves candidate diversity and lexical matching for identifiers/filenames over the dense-only baseline in *Benchmark A*, without changing downstream reranking logic.
 
 ---
 
-## 5. Storage Topology: Local Persistent Disk Directory vs. In-Memory Sub-Processes
-* **Context**: Developing and testing data processing engines across large software products requires an index store that retains state between terminal sessions, without generating complex infrastructure or networking overhead.
+## 9. Repository-Aware Candidate Expansion
+
+* **Context**: Cross-repository questions need evidence from both repos, but a single global hybrid query tends to concentrate candidates in whichever repository scores higher on average, starving the other.
 * **Options Considered**:
-    1.  **Ephemeral Engine (`:memory:`)**: Lightweight and configuration-free, but wipes all embedded collections as soon as the Python thread loop exits.
-    2.  **Persistent Storage Directory**: Configure the vector backend client to write collection configurations, indexes, and dense matrices directly to a local path on disk.
-* **Decision**: Chosen **Option 2 (Persistent Storage Directory)**.
-* **Justification**: Configured via `QdrantClient(path="data/qdrant_storage")` (or an equivalent local file scheme via environment paths). This eliminates the friction of maintaining local Docker container layouts or cloud database subscriptions during initial development, while ensuring data persists across system restarts and standalone evaluation iterations.
+  1. Increase global retrieval depth.
+  2. Manually expand against a fixed repo list.
+  3. Dynamically detect which repositories are represented in the initial candidate pool, then run a targeted second hybrid pass scoped to each.
+* **Decision**: Option 3.
+* **Implementation**: after the initial hybrid pass, active repositories are inferred from the returned payloads; a second hybrid query is run per detected repo and merged with the first pass, deduplicated by point ID.
+* **Result**: see *Benchmark B*, "Hybrid + Repo Expansion + AST" column — the largest single improvement measured so far (Recall@10 0.33 → 0.50, MRR 0.28 → 0.34), at the cost of ~35% higher P95 latency from the extra scoped queries.
 
 ---
 
-## 6. Throughput Optimization: Explicit Payload Filter Indexing
-* **Context**: Generic vector lookup algorithms compute cosine similarities across the entire collection space. As multi-repo indexing climbs to thousands of blocks, cross-talk between unrelated project layers degrades retrieval precision and introduces query latency.
-* **Options Considered**:
-    1.  **Post-Retrieval Filtering**: Extract a wide global vector array (`limit=100`), then programmatically prune out unwanted items using matching lists in memory. (Highly wasteful; burns database performance budget on irrelevant documents).
-    2.  **Database Payload Keyword Indexing**: Direct the engine to build optimized search index maps over key filtering attributes during collection setup.
-* **Decision**: Chosen **Option 2 (Database Payload Keyword Indexing)**.
-* **Justification**: Managed during system setup by configuring payload indices over critical string keys like `repo_name` and `file_path`. This updates the database storage topology to process keyword constraints directly at the storage level, reducing query execution times down to single-digit milliseconds for tightly scoped repository queries.
+## 10. Planned Next Step: Named Multi-Vector Storage
+
+* **Context**: The current collection stores a single unnamed dense vector per point; sparse vectors are generated at query time rather than stored natively.
+* **Plan**: Migrate to a named multi-vector Qdrant collection holding dense and sparse representations side by side, enabling native RRF at the storage layer and independent evaluation of dense-only, sparse-only, and hybrid retrieval without re-embedding.
+* **Status**: not yet implemented.
 
 ---
 
-## 7. Operational Resilience: Post-File Drift Pruning & Atomic State Processing
-* **Context**: Code bases change; code blocks shrink or expand, and files are deleted. If a modified file produces fewer chunks than it did previously, the extra vector items from the older iteration remain orphaned in the database, introducing noise.
-* **Design Implementation**:
-    * **Atomicity Strategy**: In `src/ingest.py`, file tracking follows a strict sequence: chunk parsing $\rightarrow$ redaction scrubbing $\rightarrow$ text vectorization $\rightarrow$ vector upserting $\rightarrow$ stale point pruning. The file is marked as processed in SQLite *only* after all these stages succeed. If an error occurs, the state ledger remains un-updated, ensuring a clean retry on the next run.
-    * **Drift Pruning**: `VectorStoreManager.prune_file_chunks()` evaluates the index using the array of active UUIDs generated during the current run. Chunks tied to the same file but missing from the active list are immediately pruned, eliminating old data remnants.
-    * **Orphan Reconciliation**: A separate reconciliation function scans all records in the SQLite database against the file system. If a file is missing locally, its orphaned vectors are removed from the vector database, and its record is cleared from the state table.
+## Benchmark Results
 
----
+Both runs use the 30-question benchmark from Decision 5.
 
-## 8. Handling Ingestion Noise: The Evolution of the Test File Penalty
-* **Context**: Baseline evaluation queries returned a high volume of test suite files (e.g., `fastapi/tests/...`, `qdrant-client/tests/...`). Because test suites contain hyper-dense concentrations of target implementation keywords and mock sub-invocations, they artificially outperform production files in standard dense vector space, creating a "Test File Swamp."
-* **Why the Penalty Was Added**: Completely dropping test directories eliminates the RAG system's ability to answer developer queries regarding *how to test* the target architectures. Run-time penalization was selected to allow production source files to naturally claim the top ranks over test code while retaining full codebase context.
-* **The Parametric Tuning Progression**:
-    1.  **Initial Attempt (Penalty = `-0.15`)**: Successfully suppressed baseline test files on simple queries. However, for complex multi-repository questions, highly repetitive integration tests (such as `qdrant-client/tests/congruence_tests/test_updates.py`) still possessed baseline vector scores high enough to break through the filter, occupying the Rank 2 slot.
-    2.  **Iterative Tuning (Penalty = `-0.30`)**: Doubled the penalty to actively drive test files out of the critical context generation window (Top 2 slots).
-* **The Structural Result**: Increasing the penalty to `-0.30` broke the testing blockade. In the `DIVERSIFIED_AST` mode for the cross-repo query, the stubborn integration test (`test_updates.py`) was successfully demoted from Rank 2 down to Rank 3. This allowed a completely new, production-level utility module (`qdrant-client/tools/async_client_generator/fastembed_generator.py`) to rise to the surface at Rank 2.
+### Benchmark A — Dense-Only (pre-hybrid baseline, generated 2026-06-25)
 
----
+| Metric | Dense Baseline | Dense + AST Rerank | Dense + Repo Expansion + AST |
+|:---|---:|---:|---:|
+| MRR | 0.199 | 0.270 | 0.281 |
+| Recall@1 | 0.150 | 0.233 | 0.250 |
+| Recall@3 | 0.217 | 0.233 | 0.267 |
+| Recall@5 | 0.233 | 0.233 | 0.267 |
+| Recall@10 | 0.233 | 0.233 | 0.267 |
+| P95 Latency (ms) | 116.0 | 82.9 | 206.1 |
 
-## 9. Candidate Generation Optimization: Candidate Expansion Sweeps vs. Heuristic Overfitting
-* **Context**: Multi-repository integration queries tracking asynchronous coordination boundary interfaces suffer from cross-repository semantic imbalance during dense vector retrieval. 
-* **The Engineering Review Milestone**: Deep pool debugging (`eval_true_rank.py`) proved that target production files like `qdrant_client.py` were entirely absent from initial global retrieval pools up to a depth of 150 hits, while `applications.py` sat deep at Rank 29. This isolated the core system bottleneck to **Candidate Generation/Retrieval Quality** rather than Reranker weight configurations.
-* **Rejected Alternative (Filename-Specific Boosting)**: Programmatic runtime score inflation for hardcoded signatures (e.g., boosting `applications.py` or `qdrant_client.py`) was explicitly rejected. While it artificializes benchmark metrics, it couples the retrieval model directly to naming conventions of specific projects, breaking generalizability to other software repositories.
-* **The Implemented Strategy (Parametric Domain Expansion Sweep)**: To uncover hidden distributed dependencies safely without target leakage, the system executes a multi-stage candidate discovery pipeline:
-  1. **Semantic Anchor Pass**: Run a baseline global dense query ($K=20$) to dynamically infer active repository namespaces.
-  2. **Bounded Filtered Expansion**: Execute isolated, payload-filtered queries restricted to the discovered repository keys up to a swept limit ($L$).
-  3. **Noise Truncation Window**: Merge and sort candidates via raw cosine similarity, discarding items outside the Top 50 to shield the downstream `ASTAwareReranker` from high-entropy vector noise.
-* **Hyperparameter Matrix**:
+This is the run referenced in Decision 6 — Recall@10 plateaus at 0.267 even with reranking and repo expansion layered on top of dense-only candidate generation, which is what pointed at candidate generation (not reranking) as the bottleneck.
 
-| Configuration Strategy | Recall@1 | Recall@3 | Recall@5 | P95 Latency (ms) | Operational Status |
-| :--- | :---: | :---: | :---: | :---: | :--- |
-| Dense Baseline (Global) | 0.50 | 0.50 | 0.50 | ~291ms | Baseline Noise Ceiling |
-| Repo Expansion (Limit=15) + AST | 0.50 | 0.50 | 0.50 | ~206ms | Insufficient Sweep Depth |
-| Repo Expansion (Limit=30) + AST | *TBD* | *TBD* | *TBD* | *TBD* | Experimental Sweep Slot |
-| Repo Expansion (Limit=45) + AST | *TBD* | *TBD* | *TBD* | *TBD* | Experimental Sweep Slot |
-| Repo Expansion (Limit=60) + AST | *TBD* | *TBD* | *TBD* | *TBD* | Latency Bounds Test Block |
+### Benchmark B — Hybrid Retrieval (current, generated 2026-07-01)
+
+| Metric | Hybrid (Dense + BM25 + RRF) Baseline | Hybrid + AST Rerank | Hybrid + Repo Expansion + AST |
+|:---|---:|---:|---:|
+| MRR | 0.221 | 0.281 | 0.335 |
+| Recall@1 | 0.133 | 0.217 | 0.233 |
+| Recall@3 | 0.217 | 0.217 | 0.250 |
+| Recall@5 | 0.250 | 0.283 | 0.333 |
+| Recall@10 | 0.333 | 0.450 | 0.500 |
+| P95 Latency (ms) | 164.5 | 119.2 | 221.0 |
+
+**Reading these honestly**: switching to hybrid candidate generation (Decision 8) lifted the Recall@10 ceiling from 0.267 to 0.333 before any reranking. Repo-aware expansion (Decision 9) then pushed it to 0.500 — the single biggest lever measured so far. But even in the best configuration, half of the golden-answer files still never appear in the top 10. That's still a candidate-generation limitation, not a reranking one, and it's the reason Decision 10 (named multi-vector storage) and a real cross-encoder reranker are the next priorities, ahead of any further heuristic tuning.
