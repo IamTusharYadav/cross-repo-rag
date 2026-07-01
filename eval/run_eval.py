@@ -5,9 +5,9 @@ from dotenv import load_dotenv
 import asyncio
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from qdrant_client import QdrantClient, models
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from fastembed import SparseTextEmbedding
 from src.search.heuristic_reranker import ASTAwareReranker
 
@@ -15,6 +15,8 @@ load_dotenv()
 
 
 class RetrievalEvaluator:
+    COLLECTION_NAME = "cross_repo_rag"
+
     # Primary Retrieval Phase Limits
     PRIMARY_PREFETCH_LIMIT = 60  # Depth of initial dense/sparse streams before fusion
     PRIMARY_POOL_LIMIT = 20  # Max candidates kept after initial RRF fusion
@@ -37,6 +39,9 @@ class RetrievalEvaluator:
         self.sparse_embed_model = SparseTextEmbedding(model_name="Qdrant/bm25")
 
         self.ast_reranker = ASTAwareReranker()
+
+        print("Loading Neural Cross-Encoder Reranker (BAAI/bge-reranker-base)...")
+        self.cross_encoder = CrossEncoder("BAAI/bge-reranker-base")
 
         with open("eval/dataset_v1.json", "r") as f:
             self.dataset = json.load(f)
@@ -77,7 +82,13 @@ class RetrievalEvaluator:
         Encodes query string into both normalized dense float arrays and
         structured sparse key-value paired tokens.
         """
-        dense_res = self.embed_model.encode(text, normalize_embeddings=True).tolist()
+        dense_res = self.embed_model.encode(
+            text,
+            batch_size=32,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        ).tolist()
 
         sparse_raw = list(self.sparse_embed_model.embed([text]))[0]
         sparse_res = models.SparseVector(
@@ -85,6 +96,46 @@ class RetrievalEvaluator:
             values=sparse_raw.values.tolist(),
         )
         return dense_res, sparse_res
+
+    def _execute_query_layer(
+        self,
+        dense_vector: List[float],
+        sparse_vector: Optional[models.SparseVector] = None,
+        prefetch_limit: int = 60,
+        pool_limit: int = 20,
+        query_filter: Optional[models.Filter] = None,
+        force_dense_only: bool = False,
+    ) -> Any:
+        """
+        Unified Qdrant access layer wrapping prefetch matrix construction and execution logic.
+        """
+        # Legacy Baseline Isolation: Fetch purely from the dense vector subsystem
+        if force_dense_only or sparse_vector is None:
+            return self.qdrant_client.query_points(
+                collection_name=self.COLLECTION_NAME,
+                query=dense_vector,
+                using="dense",
+                limit=pool_limit,
+                query_filter=query_filter,
+                with_payload=True,
+            )
+
+        # Native Hybrid Engine Execution with RRF Fusion
+        return self.qdrant_client.query_points(
+            collection_name=self.COLLECTION_NAME,
+            prefetch=[
+                models.Prefetch(
+                    query=dense_vector, using="dense", limit=prefetch_limit
+                ),
+                models.Prefetch(
+                    query=sparse_vector, using="sparse", limit=prefetch_limit
+                ),
+            ],
+            query=models.FusionQuery(fusion=models.Fusion.RRF),
+            limit=pool_limit,
+            query_filter=query_filter,
+            with_payload=True,
+        )
 
     async def evaluate_pipeline(self, mode: str) -> pd.DataFrame:
         results = []
@@ -98,33 +149,22 @@ class RetrievalEvaluator:
                 self._encode_hybrid_query, item["question"]
             )
 
-            # Initial candidate pool using unified Reciprocal Rank Fusion (RRF)
+            # Core Target Base Retrieval Execution
+            is_dense_baseline = mode == "dense_baseline"
             response = await asyncio.to_thread(
-                lambda: self.qdrant_client.query_points(
-                    collection_name="cross_repo_rag",
-                    prefetch=[
-                        models.Prefetch(
-                            query=dense_vector,
-                            using="dense",
-                            limit=self.PRIMARY_PREFETCH_LIMIT,
-                        ),
-                        models.Prefetch(
-                            query=sparse_vector,
-                            using="sparse",
-                            limit=self.PRIMARY_PREFETCH_LIMIT,
-                        ),
-                    ],
-                    query=models.FusionQuery(fusion=models.Fusion.RRF),
-                    limit=self.PRIMARY_POOL_LIMIT,
-                    with_payload=True,
+                lambda: self._execute_query_layer(
+                    dense_vector=dense_vector,
+                    sparse_vector=sparse_vector,
+                    prefetch_limit=self.PRIMARY_PREFETCH_LIMIT,
+                    pool_limit=self.PRIMARY_POOL_LIMIT,
+                    force_dense_only=is_dense_baseline,
                 )
             )
             initial_hits = response.points if hasattr(response, "points") else response
-
             final_pool = list(initial_hits)
 
-            # Repository-Aware Candidate Expansion (Production Hybrid Variant)
-            if mode == "diversified_ast":
+            # Structural Repository Domain Expansion
+            if mode in ["diversified_ast", "diversified_cross"]:
                 # Detect active repositories represented in the semantic anchor pool
                 detected_repos = set()
                 for hit in initial_hits:
@@ -141,21 +181,11 @@ class RetrievalEvaluator:
                 expanded_hits = []
                 for repo in detected_repos:
                     repo_response = await asyncio.to_thread(
-                        lambda: self.qdrant_client.query_points(
-                            collection_name="cross_repo_rag",
-                            prefetch=[
-                                models.Prefetch(
-                                    query=dense_vector,
-                                    using="dense",
-                                    limit=self.EXPANSION_PREFETCH_LIMIT,
-                                ),
-                                models.Prefetch(
-                                    query=sparse_vector,
-                                    using="sparse",
-                                    limit=self.EXPANSION_PREFETCH_LIMIT,
-                                ),
-                            ],
-                            query=models.FusionQuery(fusion=models.Fusion.RRF),
+                        lambda: self._execute_query_layer(
+                            dense_vector=dense_vector,
+                            sparse_vector=sparse_vector,
+                            prefetch_limit=self.EXPANSION_PREFETCH_LIMIT,
+                            pool_limit=self.EXPANSION_POOL_LIMIT,
                             query_filter=models.Filter(
                                 must=[
                                     models.FieldCondition(
@@ -164,8 +194,6 @@ class RetrievalEvaluator:
                                     )
                                 ]
                             ),
-                            limit=self.EXPANSION_POOL_LIMIT,  # Dig deep into each identified domain
-                            with_payload=True,
                         )
                     )
                     repo_points = (
@@ -185,8 +213,41 @@ class RetrievalEvaluator:
                 final_pool = deduplicated_pool
 
             # Ranking/Sorting Selection
-            if mode in ["ast_only", "diversified_ast"]:
+            if mode == "hybrid_ast":
                 processed_hits = self.ast_reranker.rerank(item["question"], final_pool)
+            elif mode == "diversified_cross":
+                # Deep Cross-Attention Scoring Phase
+                query_text = item["question"]
+                pairs = []
+                for h in final_pool:
+                    payload = (
+                        h.payload if hasattr(h, "payload") else h.get("payload", {})
+                    )
+                    # Pull raw text preserved by the VectorStoreManager payload update
+                    chunk_text = payload.get("text_content", "")
+                    pairs.append([query_text, chunk_text])
+
+                # Execute neural scoring off-thread to maintain event-loop responsiveness
+                scores = await asyncio.to_thread(
+                    lambda: self.cross_encoder.predict(pairs).tolist() if pairs else []
+                )
+
+                processed_hits = []
+                for idx, h in enumerate(final_pool):
+                    payload = (
+                        h.payload if hasattr(h, "payload") else h.get("payload", {})
+                    )
+                    processed_hits.append(
+                        {
+                            "id": h.id,
+                            "score": scores[idx],
+                            "adjusted_score": scores[idx],
+                            "payload": payload,
+                        }
+                    )
+                processed_hits = sorted(
+                    processed_hits, key=lambda x: x["score"], reverse=True
+                )
             else:
                 # Hybrid Baseline Ranking Sort
                 processed_hits = [
@@ -224,9 +285,10 @@ class RetrievalEvaluator:
     async def run(self):
         print("Initiating Comparative Ablation Benchmark Run...")
 
-        df_base = await self.evaluate_pipeline(mode="baseline")
-        df_ast = await self.evaluate_pipeline(mode="ast_only")
-        df_div = await self.evaluate_pipeline(mode="diversified_ast")
+        df_dense = await self.evaluate_pipeline(mode="dense_baseline")
+        df_hybrid = await self.evaluate_pipeline(mode="hybrid_baseline")
+        df_ast = await self.evaluate_pipeline(mode="hybrid_ast")
+        df_cross = await self.evaluate_pipeline(mode="diversified_cross")
 
         summary = {
             "Metric": [
@@ -237,15 +299,23 @@ class RetrievalEvaluator:
                 "Recall@10",
                 "P95 Latency (ms)",
             ],
-            "Hybrid (Dense + BM25 + RRF) Baseline": [
-                df_base["mrr"].mean(),
-                df_base["recall_1"].mean(),
-                df_base["recall_3"].mean(),
-                df_base["recall_5"].mean(),
-                df_base["recall_10"].mean(),
-                np.percentile(df_base["latency_ms"], 95),
+            "Dense Baseline": [
+                df_dense["mrr"].mean(),
+                df_dense["recall_1"].mean(),
+                df_dense["recall_3"].mean(),
+                df_dense["recall_5"].mean(),
+                df_dense["recall_10"].mean(),
+                np.percentile(df_dense["latency_ms"], 95),
             ],
-            "Hybrid + AST Rerank": [
+            "Hybrid (Dense + BM25 + RRF)": [
+                df_hybrid["mrr"].mean(),
+                df_hybrid["recall_1"].mean(),
+                df_hybrid["recall_3"].mean(),
+                df_hybrid["recall_5"].mean(),
+                df_hybrid["recall_10"].mean(),
+                np.percentile(df_hybrid["latency_ms"], 95),
+            ],
+            "Hybrid + AST": [
                 df_ast["mrr"].mean(),
                 df_ast["recall_1"].mean(),
                 df_ast["recall_3"].mean(),
@@ -253,13 +323,13 @@ class RetrievalEvaluator:
                 df_ast["recall_10"].mean(),
                 np.percentile(df_ast["latency_ms"], 95),
             ],
-            "Hybrid + Repo Expansion + AST": [
-                df_div["mrr"].mean(),
-                df_div["recall_1"].mean(),
-                df_div["recall_3"].mean(),
-                df_div["recall_5"].mean(),
-                df_div["recall_10"].mean(),
-                np.percentile(df_div["latency_ms"], 95),
+            "Hybrid + Repo Expansion + Cross-Encoder": [
+                df_cross["mrr"].mean(),
+                df_cross["recall_1"].mean(),
+                df_cross["recall_3"].mean(),
+                df_cross["recall_5"].mean(),
+                df_cross["recall_10"].mean(),
+                np.percentile(df_cross["latency_ms"], 95),
             ],
         }
 
@@ -272,12 +342,10 @@ Generated on: 2026-07-01
 ## Aggregated Pipeline Performance Comparison
 {df_summary.to_markdown(index=False)}
 """
-        with open("eval/hybrid_report.md", "w") as f:
+        with open("eval/report.md", "w") as f:
             f.write(report_md)
 
-        print(
-            "Benchmarks successfully executed. Results compiled in 'eval/hybrid_report.md'."
-        )
+        print("Benchmarks successfully executed. Results compiled in 'eval/report.md'.")
 
 
 if __name__ == "__main__":

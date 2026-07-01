@@ -98,14 +98,16 @@ This document records the architectural decisions, trade-offs, and evidence behi
 * **Implementation**: after the initial hybrid pass, active repositories are inferred from the returned payloads; a second hybrid query is run per detected repo and merged with the first pass, deduplicated by point ID.
 * **Result**: see *Benchmark B*, "Hybrid + Repo Expansion + AST" column — the largest single improvement measured so far (Recall@10 0.33 → 0.50, MRR 0.28 → 0.34), at the cost of ~35% higher P95 latency from the extra scoped queries.
 
+
 ---
-
-## 10. Planned Next Step: Named Multi-Vector Storage
-
-* **Context**: The current collection stores a single unnamed dense vector per point; sparse vectors are generated at query time rather than stored natively.
-* **Plan**: Migrate to a named multi-vector Qdrant collection holding dense and sparse representations side by side, enabling native RRF at the storage layer and independent evaluation of dense-only, sparse-only, and hybrid retrieval without re-embedding.
-* **Status**: not yet implemented.
-
+ 
+## 10. Neural Cross-Encoder Reranker: `BAAI/bge-reranker-base`
+ 
+* **Context**: The heuristic `ASTAwareReranker` (Decision 9's rerank step) adjusts scores via path penalties, symbol-token matching, and call-graph bonuses — a legitimate but hand-tuned technique with no learned semantic understanding of the query/chunk relationship.
+* **Decision**: Add a `diversified_cross` pipeline mode that scores the deduplicated, repo-expanded candidate pool with a real cross-encoder (`CrossEncoder("BAAI/bge-reranker-base")`, loaded once in `__init__`, called via `.predict()` over `[query, chunk_text]` pairs) instead of the heuristic reranker, evaluated as its own column rather than replacing the heuristic mode.
+* **Result**: see *Benchmark C* below — Recall@10 improves to 0.483 (the highest recorded), but MRR (0.185) and Recall@1 (0.067) are the worst of any configuration measured, and P95 latency is 12,361 ms.
+* **Latency assessment**: the cross-encoder is instantiated once, not per-query, so this is not a model-reload bug. The likely cause is unbatched, untruncated `CrossEncoder.predict()` calls over a wide candidate pool (up to `PRIMARY_POOL_LIMIT` + `EXPANSION_POOL_LIMIT` × detected repos, i.e. potentially 35–50 pairs per query) with each pair's chunk text going in at full length. This is a real, expected cost of cross-attention reranking at this pool size and precision, not a defect — but 12s is unusable for interactive use and needs addressing before this mode is production-viable: cap the pool fed to the cross-encoder, set `max_length` on `predict()`, and/or move inference to GPU.
+* **Ranking-quality assessment**: still open — see Decision 12. Recall@10 rising while MRR and Recall@1 fall is not automatically evidence the cross-encoder is wrong; it may be scoring pool members it wasn't given before (post-expansion) that the heuristic reranker never saw. This needs to be separated from the open dense/hybrid discrepancies below before drawing a conclusion either way.
 ---
 
 ## Benchmark Results
@@ -125,7 +127,7 @@ Both runs use the 30-question benchmark from Decision 5.
 
 This is the run referenced in Decision 6 — Recall@10 plateaus at 0.267 even with reranking and repo expansion layered on top of dense-only candidate generation, which is what pointed at candidate generation (not reranking) as the bottleneck.
 
-### Benchmark B — Hybrid Retrieval (current, generated 2026-07-01)
+### Benchmark B — Hybrid Retrieval (generated 2026-07-01)
 
 | Metric | Hybrid (Dense + BM25 + RRF) Baseline | Hybrid + AST Rerank | Hybrid + Repo Expansion + AST |
 |:---|---:|---:|---:|
@@ -137,3 +139,16 @@ This is the run referenced in Decision 6 — Recall@10 plateaus at 0.267 even wi
 | P95 Latency (ms) | 164.5 | 119.2 | 221.0 |
 
 **Reading these honestly**: switching to hybrid candidate generation (Decision 8) lifted the Recall@10 ceiling from 0.267 to 0.333 before any reranking. Repo-aware expansion (Decision 9) then pushed it to 0.500 — the single biggest lever measured so far. But even in the best configuration, half of the golden-answer files still never appear in the top 10. That's still a candidate-generation limitation, not a reranking one, and it's the reason Decision 10 (named multi-vector storage) and a real cross-encoder reranker are the next priorities, ahead of any further heuristic tuning.
+
+### Benchmark C — Cross-Encoder Trial (2026-07-01)
+ 
+| Metric | Dense Baseline | Hybrid (Dense + BM25 + RRF) | Hybrid + AST | Hybrid + Repo Expansion + Cross-Encoder |
+|:---|---:|---:|---:|---:|
+| MRR | 0.278 | 0.239 | 0.281 | 0.185 |
+| Recall@1 | 0.217 | 0.150 | 0.217 | 0.067 |
+| Recall@3 | 0.317 | 0.217 | 0.217 | 0.183 |
+| Recall@5 | 0.317 | 0.283 | 0.283 | 0.217 |
+| Recall@10 | 0.367 | 0.333 | 0.450 | 0.483 |
+| P95 Latency (ms) | 113.0 | 120.3 | 100.3 | 12,361.7 |
+ 
+Column-by-column status: the final column's high latency is explained (Decision 10 — unbatched cross-attention over a wide pool, not a reload bug) but its ranking-quality result is not yet interpretable on its own, because the **Dense Baseline** and **Hybrid** columns in this same run don't reconcile with Benchmarks A/B.
